@@ -12,6 +12,9 @@ from typing import Any
 
 import yaml
 
+from agent.patch_utils import apply_unified_diff
+from agent.test_agent import propose_test_patch
+
 # --- paths ---
 REPO_DIR = Path(__file__).resolve().parents[1]
 CONFIG_DIR = REPO_DIR / "configs"
@@ -62,6 +65,10 @@ def run_cmd(name: str, cmd: list[str], cwd: Path, timeout_s: int = 600) -> ToolE
     )
 
 
+def run_pytest(repo: Path) -> ToolEvent:
+    return run_cmd(name="pytest", cmd=["python", "-m", "pytest", "-q"], cwd=repo)
+
+
 def safe_run_text(cmd: list[str], cwd: Path) -> str:
     try:
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=30)
@@ -82,10 +89,20 @@ def load_task(task_id: str) -> dict[str, Any]:
     return tasks[task_id]
 
 
-def gates_full(repo: Path) -> list[ToolEvent]:
-    # These are your Week-1 "quality gates"
+def autoformat(repo: Path) -> list[ToolEvent]:
+    # Safe auto-fixers (especially useful after LLM edits tests)
     cmds = [
-        ("pytest", ["python", "-m", "pytest", "-q"]),
+        ("ruff_fix", ["python", "-m", "ruff", "check", ".", "--fix"]),
+        ("black", ["python", "-m", "black", "."]),
+    ]
+    events: list[ToolEvent] = []
+    for name, cmd in cmds:
+        events.append(run_cmd(name=name, cmd=cmd, cwd=repo))
+    return events
+
+
+def gates_quality(repo: Path) -> list[ToolEvent]:
+    cmds = [
         ("ruff", ["python", "-m", "ruff", "check", "."]),
         ("black_check", ["python", "-m", "black", "--check", "."]),
         ("mypy", ["python", "-m", "mypy", "src"]),
@@ -114,24 +131,97 @@ def build_environment_snapshot(repo: Path) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Week-1 orchestrator: run gates + log JSON results"
+        description="Orchestrator: run pytest loop (with TestAgent) + quality gates + log JSON results"
     )
     parser.add_argument("--task", required=True, help="Task id from configs/tasks.json")
     parser.add_argument(
         "--workflow", default="code_first", help="Workflow name from configs/workflows.yaml"
     )
+    parser.add_argument("--model", default="llama3.2:latest", help="Ollama model name (local)")
     args = parser.parse_args()
 
     task = load_task(args.task)
     workflow = load_workflow(args.workflow)
 
+    entrypoints = task.get("entrypoints", [])
+    target_source_relpath = entrypoints[0] if entrypoints else "src/example_pkg/math_utils.py"
+
     run_id = uuid.uuid4().hex[:10]
     started = time.time()
-
     tool_events: list[ToolEvent] = []
-    tool_events.extend(gates_full(REPO_DIR))
 
-    ok = all(e.returncode == 0 for e in tool_events)
+    max_iter = int(workflow.get("budget", {}).get("max_iterations", 3))
+
+    # --- Phase 1: pytest loop with TestAgent ---
+    pytest_ok = False
+    last_pytest_text = ""
+
+    for i in range(max_iter):
+        ev = run_pytest(REPO_DIR)
+        tool_events.append(ev)
+
+        last_pytest_text = (ev.stdout or "") + "\n" + (ev.stderr or "")
+        if ev.returncode == 0:
+            pytest_ok = True
+            break
+
+        # Ask TestAgent to propose a patch for tests/
+        tr = propose_test_patch(
+            repo_dir=REPO_DIR,
+            task_id=args.task,
+            target_source_relpath=target_source_relpath,
+            pytest_output=last_pytest_text,
+            model=args.model,
+        )
+
+        if not tr.ok:
+            tool_events.append(
+                ToolEvent(
+                    name="test_agent_error",
+                    cmd=["test_agent"],
+                    returncode=1,
+                    seconds=0.0,
+                    stdout=tr.message,
+                    stderr=(tr.patch or "")[:1500],
+                )
+            )
+            break
+
+        # Apply patch
+        pr = apply_unified_diff(REPO_DIR, tr.patch)
+        tool_events.append(
+            ToolEvent(
+                name="apply_test_patch",
+                cmd=["git", "apply"],
+                returncode=0 if pr.ok else 1,
+                seconds=0.0,
+                stdout=pr.message,
+                stderr="" if pr.ok else (tr.patch or "")[:1500],
+            )
+        )
+        if not pr.ok:
+            break
+
+        # Auto-format after patch (helps future gates)
+        tool_events.extend(autoformat(REPO_DIR))
+
+        # Log iteration count as a lightweight event
+        tool_events.append(
+            ToolEvent(
+                name="iteration",
+                cmd=["loop", str(i + 1), "of", str(max_iter)],
+                returncode=0,
+                seconds=0.0,
+                stdout="",
+                stderr="",
+            )
+        )
+
+    # --- Phase 2: quality gates ---
+    if pytest_ok:
+        tool_events.extend(gates_quality(REPO_DIR))
+
+    ok = pytest_ok and all(e.returncode == 0 for e in tool_events)
     status = "PASS" if ok else "FAIL"
 
     finished = time.time()
@@ -149,6 +239,8 @@ def main() -> None:
             "task_description": task.get("description", ""),
             "workflow_description": workflow.get("description", ""),
             "budget": workflow.get("budget", {}),
+            "target_source_relpath": target_source_relpath,
+            "model": args.model,
         },
     )
 

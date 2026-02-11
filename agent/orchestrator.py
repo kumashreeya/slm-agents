@@ -6,12 +6,11 @@ import platform
 import subprocess
 import time
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
-
 
 # --- paths ---
 REPO_DIR = Path(__file__).resolve().parents[1]
@@ -114,9 +113,13 @@ def build_environment_snapshot(repo: Path) -> dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Week-1 orchestrator: run gates + log JSON results")
+    parser = argparse.ArgumentParser(
+        description="Week-1 orchestrator: run gates + log JSON results"
+    )
     parser.add_argument("--task", required=True, help="Task id from configs/tasks.json")
-    parser.add_argument("--workflow", default="code_first", help="Workflow name from configs/workflows.yaml")
+    parser.add_argument(
+        "--workflow", default="code_first", help="Workflow name from configs/workflows.yaml"
+    )
     args = parser.parse_args()
 
     task = load_task(args.task)
@@ -169,4 +172,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

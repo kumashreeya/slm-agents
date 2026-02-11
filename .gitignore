@@ -1,0 +1,22 @@
+# Virtual environment
+.venv/
+
+# Python caches
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage outputs
+.coverage
+coverage.xml
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Results logs (keep folder but ignore run outputs)
+results/runs/*
+!.gitkeep
+

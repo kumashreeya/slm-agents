@@ -1,0 +1,18 @@
+workflows:
+  code_first:
+    description: "Run all gates once (Week-1). Later: code -> test -> quality."
+    budget:
+      max_iterations: 3
+      max_tool_calls: 20
+      max_seconds: 600
+    order: ["gates_full"]
+
+  iterative_loop:
+    description: "Week-1 placeholder. Later: generate -> test -> repair -> repeat -> final gates."
+    budget:
+      max_iterations: 5
+      max_tool_calls: 30
+      max_seconds: 900
+    order: ["gates_full"]
+
+

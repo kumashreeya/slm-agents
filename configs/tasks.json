@@ -1,0 +1,8 @@
+{
+  "demo_add": {
+    "description": "Demo task for Week-1: ensure add(a,b) works and gates pass.",
+    "entrypoints": ["src/example_pkg/math_utils.py"]
+  }
+}
+
+

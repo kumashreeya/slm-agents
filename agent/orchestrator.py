@@ -13,6 +13,7 @@ from typing import Any
 import yaml
 
 from agent.patch_utils import apply_unified_diff
+from agent.quality_agent import propose_quality_patch
 from agent.test_agent import propose_test_patch
 
 # --- paths ---
@@ -21,7 +22,6 @@ CONFIG_DIR = REPO_DIR / "configs"
 RESULTS_DIR = REPO_DIR / "results" / "runs"
 
 
-# --- data structures ---
 @dataclass
 class ToolEvent:
     name: str
@@ -69,28 +69,7 @@ def run_pytest(repo: Path) -> ToolEvent:
     return run_cmd(name="pytest", cmd=["python", "-m", "pytest", "-q"], cwd=repo)
 
 
-def safe_run_text(cmd: list[str], cwd: Path) -> str:
-    try:
-        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=30)
-        out = (p.stdout or "").strip()
-        err = (p.stderr or "").strip()
-        return out if out else err
-    except Exception:
-        return ""
-
-
-def load_workflow(workflow_name: str) -> dict[str, Any]:
-    data = yaml.safe_load((CONFIG_DIR / "workflows.yaml").read_text(encoding="utf-8"))
-    return data["workflows"][workflow_name]
-
-
-def load_task(task_id: str) -> dict[str, Any]:
-    tasks = json.loads((CONFIG_DIR / "tasks.json").read_text(encoding="utf-8"))
-    return tasks[task_id]
-
-
 def autoformat(repo: Path) -> list[ToolEvent]:
-    # Safe auto-fixers (especially useful after LLM edits tests)
     cmds = [
         ("ruff_fix", ["python", "-m", "ruff", "check", ".", "--fix"]),
         ("black", ["python", "-m", "black", "."]),
@@ -115,6 +94,16 @@ def gates_quality(repo: Path) -> list[ToolEvent]:
     return events
 
 
+def safe_run_text(cmd: list[str], cwd: Path) -> str:
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=30)
+        out = (p.stdout or "").strip()
+        err = (p.stderr or "").strip()
+        return out if out else err
+    except Exception:
+        return ""
+
+
 def build_environment_snapshot(repo: Path) -> dict[str, Any]:
     return {
         "python": safe_run_text(["python", "--version"], repo),
@@ -129,13 +118,35 @@ def build_environment_snapshot(repo: Path) -> dict[str, Any]:
     }
 
 
+def load_workflow(workflow_name: str) -> dict[str, Any]:
+    data = yaml.safe_load((CONFIG_DIR / "workflows.yaml").read_text(encoding="utf-8"))
+    return data["workflows"][workflow_name]
+
+
+def load_task(task_id: str) -> dict[str, Any]:
+    tasks = json.loads((CONFIG_DIR / "tasks.json").read_text(encoding="utf-8"))
+    return tasks[task_id]
+
+
+def failing_summary(events: list[ToolEvent]) -> str:
+    parts: list[str] = []
+    for e in events:
+        if e.returncode != 0:
+            out = (e.stdout or "").strip()
+            err = (e.stderr or "").strip()
+            parts.append(
+                f"[{e.name}] returncode={e.returncode}\nSTDOUT:\n{out}\n\nSTDERR:\n{err}\n"
+            )
+    return "\n---\n".join(parts)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Orchestrator: run pytest loop (with TestAgent) + quality gates + log JSON results"
+        description="Orchestrator: pytest loop (TestAgent) + quality loop (QualityAgent) + JSON logging"
     )
     parser.add_argument("--task", required=True, help="Task id from configs/tasks.json")
     parser.add_argument(
-        "--workflow", default="code_first", help="Workflow name from configs/workflows.yaml"
+        "--workflow", default="iterative_loop", help="Workflow from configs/workflows.yaml"
     )
     parser.add_argument("--model", default="llama3.2:latest", help="Ollama model name (local)")
     args = parser.parse_args()
@@ -144,7 +155,7 @@ def main() -> None:
     workflow = load_workflow(args.workflow)
 
     entrypoints = task.get("entrypoints", [])
-    target_source_relpath = entrypoints[0] if entrypoints else "src/example_pkg/math_utils.py"
+    entry_rel = entrypoints[0] if entrypoints else "src/example_pkg/math_utils.py"
 
     run_id = uuid.uuid4().hex[:10]
     started = time.time()
@@ -152,7 +163,9 @@ def main() -> None:
 
     max_iter = int(workflow.get("budget", {}).get("max_iterations", 3))
 
-    # --- Phase 1: pytest loop with TestAgent ---
+    # -----------------------------
+    # Phase 1: pytest loop (TestAgent)
+    # -----------------------------
     pytest_ok = False
     last_pytest_text = ""
 
@@ -165,11 +178,10 @@ def main() -> None:
             pytest_ok = True
             break
 
-        # Ask TestAgent to propose a patch for tests/
         tr = propose_test_patch(
             repo_dir=REPO_DIR,
             task_id=args.task,
-            target_source_relpath=target_source_relpath,
+            target_source_relpath=entry_rel,
             pytest_output=last_pytest_text,
             model=args.model,
         )
@@ -187,7 +199,6 @@ def main() -> None:
             )
             break
 
-        # Apply patch
         pr = apply_unified_diff(REPO_DIR, tr.patch)
         tool_events.append(
             ToolEvent(
@@ -202,13 +213,11 @@ def main() -> None:
         if not pr.ok:
             break
 
-        # Auto-format after patch (helps future gates)
         tool_events.extend(autoformat(REPO_DIR))
 
-        # Log iteration count as a lightweight event
         tool_events.append(
             ToolEvent(
-                name="iteration",
+                name="pytest_iteration",
                 cmd=["loop", str(i + 1), "of", str(max_iter)],
                 returncode=0,
                 seconds=0.0,
@@ -217,13 +226,73 @@ def main() -> None:
             )
         )
 
-    # --- Phase 2: quality gates ---
+    # -----------------------------
+    # Phase 2: quality loop (QualityAgent)
+    # -----------------------------
+    quality_ok = False
+
     if pytest_ok:
-        tool_events.extend(gates_quality(REPO_DIR))
+        for i in range(max_iter):
+            # First run safe auto-fixers (ruff/black) before checking
+            tool_events.extend(autoformat(REPO_DIR))
 
-    ok = pytest_ok and all(e.returncode == 0 for e in tool_events)
+            q_events = gates_quality(REPO_DIR)
+            tool_events.extend(q_events)
+
+            if all(e.returncode == 0 for e in q_events):
+                quality_ok = True
+                break
+
+            summary = failing_summary(q_events)
+
+            qr = propose_quality_patch(
+                repo_dir=REPO_DIR,
+                task_id=args.task,
+                entrypoint_relpath=entry_rel,
+                failing_tool_output=summary,
+                model=args.model,
+            )
+
+            if not qr.ok:
+                tool_events.append(
+                    ToolEvent(
+                        name="quality_agent_error",
+                        cmd=["quality_agent"],
+                        returncode=1,
+                        seconds=0.0,
+                        stdout=qr.message,
+                        stderr=(qr.patch or "")[:1500],
+                    )
+                )
+                break
+
+            pr = apply_unified_diff(REPO_DIR, qr.patch)
+            tool_events.append(
+                ToolEvent(
+                    name="apply_quality_patch",
+                    cmd=["git", "apply"],
+                    returncode=0 if pr.ok else 1,
+                    seconds=0.0,
+                    stdout=pr.message,
+                    stderr="" if pr.ok else (qr.patch or "")[:1500],
+                )
+            )
+            if not pr.ok:
+                break
+
+            tool_events.append(
+                ToolEvent(
+                    name="quality_iteration",
+                    cmd=["loop", str(i + 1), "of", str(max_iter)],
+                    returncode=0,
+                    seconds=0.0,
+                    stdout="",
+                    stderr="",
+                )
+            )
+
+    ok = pytest_ok and quality_ok and all(e.returncode == 0 for e in tool_events)
     status = "PASS" if ok else "FAIL"
-
     finished = time.time()
 
     log = RunLog(
@@ -239,7 +308,7 @@ def main() -> None:
             "task_description": task.get("description", ""),
             "workflow_description": workflow.get("description", ""),
             "budget": workflow.get("budget", {}),
-            "target_source_relpath": target_source_relpath,
+            "entrypoint": entry_rel,
             "model": args.model,
         },
     )

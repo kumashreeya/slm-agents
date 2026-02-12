@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import shutil
 import subprocess
 import time
 import uuid
@@ -12,6 +13,7 @@ from typing import Any
 
 import yaml
 
+from agent.mutmut_metrics import read_mutmut_meta
 from agent.patch_utils import apply_unified_diff
 from agent.quality_agent import propose_quality_patch
 from agent.test_agent import propose_test_patch
@@ -227,6 +229,58 @@ def main() -> None:
         )
 
     # -----------------------------
+
+    # --- Week 3: run mutmut during the run (when enabled) ---
+    enable_mutation = bool(workflow.get("enable_mutation")) or ("week3" in args.workflow)
+    mut_scope = workflow.get("mutation_scope") or "example_pkg.math_utils*"
+
+    if pytest_ok and enable_mutation:
+        # Clean any previous mutation artifacts so results are fresh per run
+        shutil.rmtree(REPO_DIR / "mutants", ignore_errors=True)
+        t0 = time.time()
+        proc = subprocess.run(
+            ["mutmut", "run", mut_scope],
+            cwd=str(REPO_DIR),
+            capture_output=True,
+            text=True,
+        )
+        tool_events.append(
+            ToolEvent(
+                name="mutmut_run",
+                cmd=["mutmut", "run", mut_scope],
+                returncode=proc.returncode,
+                seconds=round(time.time() - t0, 3),
+                stdout=proc.stdout,
+                stderr=proc.stderr,
+            )
+        )
+
+    # --- Week 3: mutation metrics (paper-ready logging) ---
+    # Log as a ToolEvent so it fits the existing run schema.
+    try:
+        mut = read_mutmut_meta(REPO_DIR)
+        tool_events.append(
+            ToolEvent(
+                name="mutmut_meta",
+                cmd=["mutmut", "meta"],
+                returncode=0,
+                seconds=0.0,
+                stdout=json.dumps(mut, sort_keys=True),
+                stderr="",
+            )
+        )
+    except Exception as e:
+        tool_events.append(
+            ToolEvent(
+                name="mutmut_meta",
+                cmd=["mutmut", "meta"],
+                returncode=1,
+                seconds=0.0,
+                stdout="",
+                stderr=str(e),
+            )
+        )
+
     # Phase 2: quality loop (QualityAgent)
     # -----------------------------
     quality_ok = False

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import re
 import shutil
 import subprocess
 import time
@@ -161,7 +162,6 @@ def extract_rewrite_file_content(text: str, expected_relpath: str) -> tuple[bool
     if end not in text:
         return False, "", "END marker not found"
 
-    # Require exactly one BEGIN and one END (keeps parsing unambiguous)
     if text.count("### BEGIN FILE:") != 1:
         return (
             False,
@@ -182,11 +182,9 @@ def extract_rewrite_file_content(text: str, expected_relpath: str) -> tuple[bool
 
     content = text[begin_line_end + 1 : end_idx]
 
-    # Common model behavior: adds a blank line right after BEGIN marker
     if content.startswith("\n"):
         content = content[1:]
 
-    # Normalize newlines and ensure exactly one trailing newline
     content = content.replace("\r\n", "\n").replace("\r", "\n")
     content = content.rstrip("\n") + "\n"
 
@@ -207,6 +205,51 @@ def git_diff_file(repo: Path, relpath: str) -> tuple[int, str, str]:
         text=True,
     )
     return p.returncode, p.stdout or "", p.stderr or ""
+
+
+def parse_coverage_report(report_text: str, entry_rel: str) -> dict[str, Any]:
+    """
+    Reads `coverage report -m` output and extracts:
+    - total_coverage_pct
+    - entry_file_line (row for entry_rel)
+    - entry_missing (missing lines string for entry_rel, if present)
+    """
+    total_pct: float | None = None
+    entry_line: str | None = None
+    entry_missing: str = ""
+
+    lines = report_text.splitlines()
+    for line in lines:
+        if not line.strip():
+            continue
+        if line.startswith("Name") or line.startswith("---"):
+            continue
+
+        if line.startswith("TOTAL"):
+            m = re.search(r"(\d+)%", line)
+            if m:
+                total_pct = float(m.group(1))
+            continue
+
+        # Example row:
+        # src/example_pkg/math_utils.py   10      2    80%   12-13
+        m = re.search(r"^(\S+)\s+\d+\s+\d+\s+(\d+)%\s*(.*)$", line)
+        if not m:
+            continue
+
+        name = m.group(1)
+        missing = (m.group(3) or "").strip()
+
+        if name == entry_rel or name.endswith(entry_rel):
+            entry_line = line
+            entry_missing = missing
+
+    return {
+        "total_coverage_pct": total_pct,
+        "entry_rel": entry_rel,
+        "entry_file_line": entry_line,
+        "entry_missing": entry_missing,
+    }
 
 
 def main() -> None:
@@ -296,13 +339,214 @@ def main() -> None:
         )
 
     # -----------------------------
+    # Week 3A/3B: Coverage measurement + coverage-guided strengthening
+    # -----------------------------
+    enable_coverage = bool(workflow.get("enable_coverage", False))
+    coverage_target = float(workflow.get("coverage_target_pct", 95.0))
+    coverage_strengthen = bool(workflow.get("coverage_strengthen", False))
+    coverage_max_iter = int(workflow.get("coverage_max_iter", 0))
+    coverage_test_target = str(workflow.get("coverage_test_target", "tests/test_math_utils.py"))
+
+    cov_meta: dict[str, Any] | None = None
+
+    if pytest_ok and enable_coverage:
+        tool_events.append(
+            run_cmd("coverage_erase", ["python", "-m", "coverage", "erase"], cwd=REPO_DIR)
+        )
+        cov_run = run_cmd(
+            name="coverage_pytest",
+            cmd=["python", "-m", "coverage", "run", "-m", "pytest", "-q"],
+            cwd=REPO_DIR,
+        )
+        tool_events.append(cov_run)
+
+        cov_rep = run_cmd(
+            name="coverage_report",
+            cmd=["python", "-m", "coverage", "report", "-m"],
+            cwd=REPO_DIR,
+        )
+        tool_events.append(cov_rep)
+
+        cov_meta = parse_coverage_report(cov_rep.stdout or "", entry_rel)
+        tool_events.append(
+            ToolEvent(
+                name="coverage_meta",
+                cmd=["coverage", "meta"],
+                returncode=0 if cov_meta.get("total_coverage_pct") is not None else 1,
+                seconds=0.0,
+                stdout=json.dumps(cov_meta, sort_keys=True),
+                stderr="",
+            )
+        )
+
+    if pytest_ok and enable_coverage and coverage_strengthen and coverage_max_iter > 0 and cov_meta:
+        for ci in range(coverage_max_iter):
+            total_pct = cov_meta.get("total_coverage_pct")
+            missing = (cov_meta.get("entry_missing") or "").strip()
+
+            if total_pct is None:
+                break
+            if float(total_pct) >= coverage_target:
+                break
+            if not missing:
+                break
+
+            coverage_brief = (
+                f"Coverage is below target.\n"
+                f"Current TOTAL coverage: {total_pct}%\n"
+                f"Target coverage: {coverage_target}%\n\n"
+                f"Uncovered lines for {entry_rel} (from coverage report): {missing}\n\n"
+                "Please strengthen tests to execute these missing lines.\n"
+                "REWRITE MODE OUTPUT REQUIREMENTS:\n"
+                f"- Return ONLY the complete contents of {coverage_test_target}\n"
+                f"- Use EXACT markers:\n"
+                f"  ### BEGIN FILE: {coverage_test_target}\n"
+                f"  <complete file content>\n"
+                f"  ### END FILE\n"
+                "- Do NOT output a diff.\n"
+                "- Do NOT create new files.\n"
+            )
+
+            tr = propose_test_patch(
+                repo_dir=REPO_DIR,
+                task_id=args.task,
+                target_source_relpath=entry_rel,
+                pytest_output=coverage_brief,
+                model=args.model,
+                output_format="rewrite",
+                target_test_relpath=coverage_test_target,
+            )
+
+            if not tr.ok:
+                tool_events.append(
+                    ToolEvent(
+                        name="test_agent_coverage_error",
+                        cmd=["test_agent", "coverage_strengthen"],
+                        returncode=1,
+                        seconds=0.0,
+                        stdout=tr.message,
+                        stderr=(tr.patch or "")[:1500],
+                    )
+                )
+                break
+
+            ok_parse, new_content, parse_msg = extract_rewrite_file_content(
+                tr.patch, coverage_test_target
+            )
+            tool_events.append(
+                ToolEvent(
+                    name="coverage_rewrite_parse",
+                    cmd=["parse_rewrite", coverage_test_target],
+                    returncode=0 if ok_parse else 1,
+                    seconds=0.0,
+                    stdout=parse_msg,
+                    stderr="" if ok_parse else (tr.patch or "")[:1500],
+                )
+            )
+            if not ok_parse:
+                break
+
+            target_path = REPO_DIR / coverage_test_target
+            before_text = target_path.read_text(encoding="utf-8") if target_path.exists() else ""
+            target_path.write_text(new_content, encoding="utf-8", newline="\n")
+
+            rc, diff_out, diff_err = git_diff_file(REPO_DIR, coverage_test_target)
+            tool_events.append(
+                ToolEvent(
+                    name="coverage_deterministic_diff",
+                    cmd=["git", "diff", "--", coverage_test_target],
+                    returncode=0 if (rc == 0 and diff_out.strip()) else 1,
+                    seconds=0.0,
+                    stdout=diff_out if diff_out else "",
+                    stderr=(
+                        diff_err
+                        if diff_err
+                        else ("no diff produced" if not diff_out.strip() else "")
+                    ),
+                )
+            )
+
+            target_path.write_text(before_text, encoding="utf-8", newline="\n")
+
+            if not diff_out.strip():
+                tool_events.append(
+                    ToolEvent(
+                        name="coverage_no_changes",
+                        cmd=["coverage_strengthen", "no_changes"],
+                        returncode=1,
+                        seconds=0.0,
+                        stdout="rewrite produced no diff; stopping coverage iteration",
+                        stderr="",
+                    )
+                )
+                break
+
+            pr = apply_unified_diff(REPO_DIR, diff_out)
+            tool_events.append(
+                ToolEvent(
+                    name="apply_coverage_test_patch",
+                    cmd=["git", "apply"],
+                    returncode=0 if pr.ok else 1,
+                    seconds=0.0,
+                    stdout=pr.message,
+                    stderr="" if pr.ok else diff_out[:1500],
+                )
+            )
+            if not pr.ok:
+                break
+
+            tool_events.extend(autoformat(REPO_DIR))
+
+            ev = run_pytest(REPO_DIR)
+            tool_events.append(ev)
+            if ev.returncode != 0:
+                break
+
+            tool_events.append(
+                run_cmd("coverage_erase", ["python", "-m", "coverage", "erase"], cwd=REPO_DIR)
+            )
+            cov_run2 = run_cmd(
+                name="coverage_pytest",
+                cmd=["python", "-m", "coverage", "run", "-m", "pytest", "-q"],
+                cwd=REPO_DIR,
+            )
+            tool_events.append(cov_run2)
+
+            cov_rep2 = run_cmd(
+                name="coverage_report",
+                cmd=["python", "-m", "coverage", "report", "-m"],
+                cwd=REPO_DIR,
+            )
+            tool_events.append(cov_rep2)
+
+            cov_meta = parse_coverage_report(cov_rep2.stdout or "", entry_rel)
+            tool_events.append(
+                ToolEvent(
+                    name="coverage_meta",
+                    cmd=["coverage", "meta"],
+                    returncode=0 if cov_meta.get("total_coverage_pct") is not None else 1,
+                    seconds=0.0,
+                    stdout=json.dumps(cov_meta, sort_keys=True),
+                    stderr="",
+                )
+            )
+
+            tool_events.append(
+                ToolEvent(
+                    name="coverage_iteration",
+                    cmd=["loop", str(ci + 1), "of", str(coverage_max_iter)],
+                    returncode=0,
+                    seconds=0.0,
+                    stdout="",
+                    stderr="",
+                )
+            )
 
     # --- Week 3: run mutmut during the run (when enabled) ---
     enable_mutation = bool(workflow.get("enable_mutation")) or ("week3" in args.workflow)
     mut_scope = workflow.get("mutation_scope") or "example_pkg.math_utils*"
 
     if pytest_ok and enable_mutation:
-        # Clean any previous mutation artifacts so results are fresh per run
         shutil.rmtree(REPO_DIR / "mutants", ignore_errors=True)
         t0 = time.time()
         proc = subprocess.run(
@@ -323,7 +567,6 @@ def main() -> None:
         )
 
     # --- Week 3: mutation metrics (paper-ready logging) ---
-    # Keep a parsed copy for the strengthen loop, and also log it as a ToolEvent.
     mut_meta_result = None
     try:
         mut_meta_result = read_mutmut_meta(REPO_DIR)
@@ -349,8 +592,7 @@ def main() -> None:
             )
         )
 
-    # --- Week 3: mutation-guided strengthen loop (TestAgent) ---
-    # If mutants survive, ask TestAgent to strengthen tests to kill them.
+    # --- Week 3: mutation-guided strengthen loop (rewrite mode) ---
     mutation_strengthen = bool(workflow.get("mutation_strengthen", False))
     mutation_max_iter = int(workflow.get("mutation_max_iter", 0))
     mutation_max_mutants = int(workflow.get("mutation_max_mutants_per_iter", 3))
@@ -377,7 +619,6 @@ def main() -> None:
 
             target_ids = survivors[:mutation_max_mutants]
 
-            # Collect mutant diffs to give TestAgent concrete targets
             diffs: list[str] = []
             for mid in target_ids:
                 t0 = time.time()
@@ -402,7 +643,6 @@ def main() -> None:
             mutation_brief = (
                 "Mutation testing found surviving mutants.\n"
                 "Strengthen tests to kill these mutants.\n"
-                "IMPORTANT: The next block is DIAGNOSTIC output, NOT a patch to apply.\n\n"
                 "OUTPUT REQUIREMENTS (REWRITE MODE):\n"
                 f"- Return ONLY the complete contents of {test_target}\n"
                 f"- Use EXACT markers:\n"
@@ -414,7 +654,6 @@ def main() -> None:
                 "Surviving mutant diffs (diagnostic):\n\n" + "\n\n".join(diffs)
             )
 
-            # ---- REWRITE MODE CALL (robust) ----
             tr = propose_test_patch(
                 repo_dir=REPO_DIR,
                 task_id=args.task,
@@ -426,7 +665,6 @@ def main() -> None:
             )
 
             if not tr.ok:
-                # Retry once with even stricter “no extra text” reminder
                 retry_brief = mutation_brief + (
                     "\n\nFORMAT VIOLATION. Retry.\n"
                     "Return ONLY the file using markers. No extra text before/after.\n"
@@ -468,15 +706,13 @@ def main() -> None:
                     )
                     break
 
-            # Parse rewrite content
-            t0 = time.time()
             ok_parse, new_content, parse_msg = extract_rewrite_file_content(tr.patch, test_target)
             tool_events.append(
                 ToolEvent(
                     name="mutation_rewrite_parse",
                     cmd=["parse_rewrite", test_target],
                     returncode=0 if ok_parse else 1,
-                    seconds=round(time.time() - t0, 3),
+                    seconds=0.0,
                     stdout=parse_msg,
                     stderr="" if ok_parse else (tr.patch or "")[:1500],
                 )
@@ -484,11 +720,8 @@ def main() -> None:
             if not ok_parse:
                 break
 
-            # Deterministic diff generation + apply via git apply
             target_path = REPO_DIR / test_target
             before_text = target_path.read_text(encoding="utf-8") if target_path.exists() else ""
-
-            # Write proposed content to working tree to let git compute a correct diff
             target_path.write_text(new_content, encoding="utf-8", newline="\n")
 
             rc, diff_out, diff_err = git_diff_file(REPO_DIR, test_target)
@@ -507,11 +740,9 @@ def main() -> None:
                 )
             )
 
-            # Restore before state BEFORE applying via apply_unified_diff (keeps your “apply patch” design)
             target_path.write_text(before_text, encoding="utf-8", newline="\n")
 
             if not diff_out.strip():
-                # Model didn’t change the file meaningfully
                 tool_events.append(
                     ToolEvent(
                         name="mutation_rewrite_no_changes",
@@ -540,13 +771,11 @@ def main() -> None:
 
             tool_events.extend(autoformat(REPO_DIR))
 
-            # Re-run pytest to ensure we didn't break the suite
             ev = run_pytest(REPO_DIR)
             tool_events.append(ev)
             if ev.returncode != 0:
                 break
 
-            # Re-run mutmut fresh to see if we killed survivors
             shutil.rmtree(REPO_DIR / "mutants", ignore_errors=True)
             t0 = time.time()
             proc = subprocess.run(
@@ -566,7 +795,6 @@ def main() -> None:
                 )
             )
 
-            # Refresh meta + log it again
             try:
                 mut_meta_result = read_mutmut_meta(REPO_DIR)
                 tool_events.append(
@@ -603,13 +831,13 @@ def main() -> None:
                 )
             )
 
+    # -----------------------------
     # Phase 2: quality loop (QualityAgent)
     # -----------------------------
     quality_ok = False
 
     if pytest_ok:
         for i in range(max_iter):
-            # First run safe auto-fixers (ruff/black) before checking
             tool_events.extend(autoformat(REPO_DIR))
 
             q_events = gates_quality(REPO_DIR)

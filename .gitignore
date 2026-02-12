@@ -24,3 +24,7 @@ results/runs/*
 # generated
 coverage.json
 mutants/
+
+# generated artifacts
+coverage.json
+mutants/

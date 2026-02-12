@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import platform
 import re
@@ -150,9 +151,6 @@ def extract_rewrite_file_content(text: str, expected_relpath: str) -> tuple[bool
     ### BEGIN FILE: <expected_relpath>
     <full file content>
     ### END FILE
-
-    Returns: (ok, content, message)
-    Content is normalized to end with exactly one newline.
     """
     begin = f"### BEGIN FILE: {expected_relpath}"
     end = "### END FILE"
@@ -194,26 +192,41 @@ def extract_rewrite_file_content(text: str, expected_relpath: str) -> tuple[bool
     return True, content, "rewrite content parsed"
 
 
-def git_diff_file(repo: Path, relpath: str) -> tuple[int, str, str]:
+def build_patch_from_text(relpath: str, before_text: str, after_text: str) -> str:
     """
-    Return (returncode, stdout, stderr) for: git diff -- <relpath>
+    Build a git-style unified diff patch between BEFORE and AFTER text.
+
+    IMPORTANT: This compares the *two strings*, not git index vs working tree.
+    That avoids 'patch does not apply' when the working tree is already modified.
     """
-    p = subprocess.run(
-        ["git", "diff", "--", relpath],
-        cwd=str(repo),
-        capture_output=True,
-        text=True,
+    before = (before_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    after = (after_text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+    # normalize: ensure final newline
+    if before and not before.endswith("\n"):
+        before += "\n"
+    if after and not after.endswith("\n"):
+        after += "\n"
+
+    if before == after:
+        return ""
+
+    diff_lines = list(
+        difflib.unified_diff(
+            before.splitlines(),
+            after.splitlines(),
+            fromfile=f"a/{relpath}",
+            tofile=f"b/{relpath}",
+            lineterm="",
+            n=3,
+        )
     )
-    return p.returncode, p.stdout or "", p.stderr or ""
+
+    body = "\n".join(diff_lines) + "\n"
+    return f"diff --git a/{relpath} b/{relpath}\n{body}"
 
 
 def parse_coverage_report(report_text: str, entry_rel: str) -> dict[str, Any]:
-    """
-    Reads `coverage report -m` output and extracts:
-    - total_coverage_pct
-    - entry_file_line (row for entry_rel)
-    - entry_missing (missing lines string for entry_rel, if present)
-    """
     total_pct: float | None = None
     entry_line: str | None = None
     entry_missing: str = ""
@@ -231,8 +244,6 @@ def parse_coverage_report(report_text: str, entry_rel: str) -> dict[str, Any]:
                 total_pct = float(m.group(1))
             continue
 
-        # Example row:
-        # src/example_pkg/math_utils.py   10      2    80%   12-13
         m = re.search(r"^(\S+)\s+\d+\s+\d+\s+(\d+)%\s*(.*)$", line)
         if not m:
             continue
@@ -353,6 +364,7 @@ def main() -> None:
         tool_events.append(
             run_cmd("coverage_erase", ["python", "-m", "coverage", "erase"], cwd=REPO_DIR)
         )
+
         cov_run = run_cmd(
             name="coverage_pytest",
             cmd=["python", "-m", "coverage", "run", "-m", "pytest", "-q"],
@@ -448,40 +460,23 @@ def main() -> None:
 
             target_path = REPO_DIR / coverage_test_target
             before_text = target_path.read_text(encoding="utf-8") if target_path.exists() else ""
-            target_path.write_text(new_content, encoding="utf-8", newline="\n")
+            patch_text = build_patch_from_text(coverage_test_target, before_text, new_content)
 
-            rc, diff_out, diff_err = git_diff_file(REPO_DIR, coverage_test_target)
             tool_events.append(
                 ToolEvent(
                     name="coverage_deterministic_diff",
-                    cmd=["git", "diff", "--", coverage_test_target],
-                    returncode=0 if (rc == 0 and diff_out.strip()) else 1,
+                    cmd=["build_patch_from_text", coverage_test_target],
+                    returncode=0 if patch_text.strip() else 1,
                     seconds=0.0,
-                    stdout=diff_out if diff_out else "",
-                    stderr=(
-                        diff_err
-                        if diff_err
-                        else ("no diff produced" if not diff_out.strip() else "")
-                    ),
+                    stdout=patch_text[:2000],
+                    stderr="" if patch_text.strip() else "no diff produced",
                 )
             )
 
-            target_path.write_text(before_text, encoding="utf-8", newline="\n")
-
-            if not diff_out.strip():
-                tool_events.append(
-                    ToolEvent(
-                        name="coverage_no_changes",
-                        cmd=["coverage_strengthen", "no_changes"],
-                        returncode=1,
-                        seconds=0.0,
-                        stdout="rewrite produced no diff; stopping coverage iteration",
-                        stderr="",
-                    )
-                )
+            if not patch_text.strip():
                 break
 
-            pr = apply_unified_diff(REPO_DIR, diff_out)
+            pr = apply_unified_diff(REPO_DIR, patch_text)
             tool_events.append(
                 ToolEvent(
                     name="apply_coverage_test_patch",
@@ -489,7 +484,7 @@ def main() -> None:
                     returncode=0 if pr.ok else 1,
                     seconds=0.0,
                     stdout=pr.message,
-                    stderr="" if pr.ok else diff_out[:1500],
+                    stderr="" if pr.ok else patch_text[:1500],
                 )
             )
             if not pr.ok:
@@ -542,7 +537,9 @@ def main() -> None:
                 )
             )
 
-    # --- Week 3: run mutmut during the run (when enabled) ---
+    # -----------------------------
+    # Week 3C: Mutation + mutation-guided strengthening (rewrite mode)
+    # -----------------------------
     enable_mutation = bool(workflow.get("enable_mutation")) or ("week3" in args.workflow)
     mut_scope = workflow.get("mutation_scope") or "example_pkg.math_utils*"
 
@@ -566,7 +563,6 @@ def main() -> None:
             )
         )
 
-    # --- Week 3: mutation metrics (paper-ready logging) ---
     mut_meta_result = None
     try:
         mut_meta_result = read_mutmut_meta(REPO_DIR)
@@ -592,7 +588,6 @@ def main() -> None:
             )
         )
 
-    # --- Week 3: mutation-guided strengthen loop (rewrite mode) ---
     mutation_strengthen = bool(workflow.get("mutation_strengthen", False))
     mutation_max_iter = int(workflow.get("mutation_max_iter", 0))
     mutation_max_mutants = int(workflow.get("mutation_max_mutants_per_iter", 3))
@@ -665,46 +660,17 @@ def main() -> None:
             )
 
             if not tr.ok:
-                retry_brief = mutation_brief + (
-                    "\n\nFORMAT VIOLATION. Retry.\n"
-                    "Return ONLY the file using markers. No extra text before/after.\n"
-                    f"### BEGIN FILE: {test_target}\n"
-                    "<complete file content>\n"
-                    "### END FILE\n"
-                )
-                tr2 = propose_test_patch(
-                    repo_dir=REPO_DIR,
-                    task_id=args.task,
-                    target_source_relpath=entry_rel,
-                    pytest_output=retry_brief,
-                    model=args.model,
-                    output_format="rewrite",
-                    target_test_relpath=test_target,
-                )
-                if tr2.ok:
-                    tr = tr2
-                    tool_events.append(
-                        ToolEvent(
-                            name="test_agent_mutation_retry",
-                            cmd=["test_agent", "mutation_strengthen", "rewrite_retry1"],
-                            returncode=0,
-                            seconds=0.0,
-                            stdout="rewrite retry succeeded",
-                            stderr="",
-                        )
+                tool_events.append(
+                    ToolEvent(
+                        name="test_agent_mutation_error",
+                        cmd=["test_agent", "mutation_strengthen", "rewrite_mode"],
+                        returncode=1,
+                        seconds=0.0,
+                        stdout=tr.message,
+                        stderr=(tr.patch or "")[:1500],
                     )
-                else:
-                    tool_events.append(
-                        ToolEvent(
-                            name="test_agent_mutation_error",
-                            cmd=["test_agent", "mutation_strengthen", "rewrite_mode"],
-                            returncode=1,
-                            seconds=0.0,
-                            stdout=tr2.message,
-                            stderr=(tr2.patch or "")[:1500],
-                        )
-                    )
-                    break
+                )
+                break
 
             ok_parse, new_content, parse_msg = extract_rewrite_file_content(tr.patch, test_target)
             tool_events.append(
@@ -722,40 +688,23 @@ def main() -> None:
 
             target_path = REPO_DIR / test_target
             before_text = target_path.read_text(encoding="utf-8") if target_path.exists() else ""
-            target_path.write_text(new_content, encoding="utf-8", newline="\n")
+            patch_text = build_patch_from_text(test_target, before_text, new_content)
 
-            rc, diff_out, diff_err = git_diff_file(REPO_DIR, test_target)
             tool_events.append(
                 ToolEvent(
                     name="mutation_deterministic_diff",
-                    cmd=["git", "diff", "--", test_target],
-                    returncode=0 if (rc == 0 and diff_out.strip()) else 1,
+                    cmd=["build_patch_from_text", test_target],
+                    returncode=0 if patch_text.strip() else 1,
                     seconds=0.0,
-                    stdout=diff_out if diff_out else "",
-                    stderr=(
-                        diff_err
-                        if diff_err
-                        else ("no diff produced" if not diff_out.strip() else "")
-                    ),
+                    stdout=patch_text[:2000],
+                    stderr="" if patch_text.strip() else "no diff produced",
                 )
             )
 
-            target_path.write_text(before_text, encoding="utf-8", newline="\n")
-
-            if not diff_out.strip():
-                tool_events.append(
-                    ToolEvent(
-                        name="mutation_rewrite_no_changes",
-                        cmd=["rewrite_mode", "no_changes"],
-                        returncode=1,
-                        seconds=0.0,
-                        stdout="rewrite produced no diff; stopping mutation iteration",
-                        stderr="",
-                    )
-                )
+            if not patch_text.strip():
                 break
 
-            pr = apply_unified_diff(REPO_DIR, diff_out)
+            pr = apply_unified_diff(REPO_DIR, patch_text)
             tool_events.append(
                 ToolEvent(
                     name="apply_mutation_test_patch",
@@ -763,7 +712,7 @@ def main() -> None:
                     returncode=0 if pr.ok else 1,
                     seconds=0.0,
                     stdout=pr.message,
-                    stderr="" if pr.ok else diff_out[:1500],
+                    stderr="" if pr.ok else patch_text[:1500],
                 )
             )
             if not pr.ok:

@@ -23,12 +23,12 @@ workflows:
     order: *id002
     enable_mutation: true
     mutation_scope: example_pkg.math_utils*
-    mutation_strengthen: true
+    mutation_strengthen: false
     mutation_max_iter: 3
     mutation_max_mutants_per_iter: 3
     mutation_target_score: 1.0
     enable_coverage: true
-    coverage_target_pct: 95.0
+    coverage_target_pct: 100.0
     coverage_strengthen: true
-    coverage_max_iter: 2
+    coverage_max_iter: 1
     coverage_test_target: tests/test_math_utils.py

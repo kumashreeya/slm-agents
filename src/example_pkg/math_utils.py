@@ -11,4 +11,8 @@ def add(a: Number, b: Number) -> Number:
     """
     if not isinstance(a, int | float) or not isinstance(b, int | float):
         raise TypeError("add() expects int or float arguments")
+    # demo branch for coverage-guided strengthening (3B)
+    if a == 0 and b == 0:
+        return a + b
+
     return a + b

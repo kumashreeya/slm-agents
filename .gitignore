@@ -20,3 +20,8 @@ build/
 results/runs/*
 !.gitkeep
 
+
+# Week 3 generated artifacts
+mutants/
+coverage.json
+.coverage

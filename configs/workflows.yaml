@@ -1,18 +1,29 @@
 workflows:
   code_first:
-    description: "Run all gates once (Week-1). Later: code -> test -> quality."
+    description: 'Run all gates once (Week-1). Later: code -> test -> quality.'
     budget:
       max_iterations: 3
       max_tool_calls: 20
       max_seconds: 600
-    order: ["gates_full"]
-
+    order:
+    - gates_full
   iterative_loop:
-    description: "Week-1 placeholder. Later: generate -> test -> repair -> repeat -> final gates."
-    budget:
+    description: 'Week-1 placeholder. Later: generate -> test -> repair -> repeat
+      -> final gates.'
+    budget: &id001
       max_iterations: 5
       max_tool_calls: 30
       max_seconds: 900
-    order: ["gates_full"]
-
-
+    order: &id002
+    - gates_full
+  iterative_loop_week3:
+    description: 'Week-1 placeholder. Later: generate -> test -> repair -> repeat
+      -> final gates.'
+    budget: *id001
+    order: *id002
+    enable_mutation: true
+    mutation_scope: example_pkg.math_utils*
+    mutation_strengthen: true
+    mutation_max_iter: 3
+    mutation_max_mutants_per_iter: 3
+    mutation_target_score: 1.0

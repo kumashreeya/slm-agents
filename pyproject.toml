@@ -2,11 +2,16 @@
 line-length = 100
 target-version = ["py311"]
 
+extend-exclude = '''
+^/mutants/
+'''
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 src = ["src"]
 
+extend-exclude = ["mutants"]
+force-exclude = true
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
 ignore = ["E501"]
@@ -24,3 +29,7 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 addopts = "-q"
 
+
+[tool.mutmut]
+paths_to_mutate = ["src/"]
+pytest_add_cli_args_test_selection = ["tests/"]

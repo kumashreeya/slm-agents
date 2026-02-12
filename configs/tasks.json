@@ -1,8 +1,14 @@
 {
   "demo_add": {
     "description": "Demo task for Week-1: ensure add(a,b) works and gates pass.",
-    "entrypoints": ["src/example_pkg/math_utils.py"]
+    "entrypoints": [
+      "src/example_pkg/math_utils.py"
+    ]
+  },
+  "demo_add_weak_tests": {
+    "description": "Demo task with intentionally weak tests to trigger mutation-strengthen loop",
+    "entrypoints": [
+      "src/example_pkg/math_utils.py"
+    ]
   }
 }
-
-

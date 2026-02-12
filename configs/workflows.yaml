@@ -23,3 +23,7 @@ workflows:
     order: *id002
     enable_mutation: true
     mutation_scope: example_pkg.math_utils*
+    mutation_strengthen: true
+    mutation_max_iter: 3
+    mutation_max_mutants_per_iter: 3
+    mutation_target_score: 1.0

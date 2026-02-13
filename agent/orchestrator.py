@@ -15,8 +15,9 @@ from typing import Any
 
 import yaml
 
+from agent.code_agent import propose_code_patch
 from agent.mutmut_metrics import read_mutmut_meta
-from agent.patch_utils import apply_unified_diff
+from agent.patch_utils import apply_unified_diff, extract_rewrite_file
 from agent.quality_agent import propose_quality_patch
 from agent.test_agent import propose_test_patch
 
@@ -285,6 +286,69 @@ def main() -> None:
     tool_events: list[ToolEvent] = []
 
     max_iter = int(workflow.get("budget", {}).get("max_iterations", 3))
+
+    # -----------------------------
+    # Phase 0: Code Generation (CodeAgent) - NEW!
+    # -----------------------------
+    code_mode = task.get("mode", "")
+    feature_description = task.get("feature_description", "")
+
+    if code_mode == "generate" and feature_description:
+        # Generate new code from description
+        cr = propose_code_patch(
+            repo_dir=REPO_DIR,
+            task_id=args.task,
+            target_source_relpath=entry_rel,
+            model=args.model,
+            mode="generate",
+            feature_description=feature_description,
+        )
+
+        if not cr.ok:
+            tool_events.append(
+                ToolEvent(
+                    name="code_agent_generate_error",
+                    cmd=["code_agent", "generate"],
+                    returncode=1,
+                    seconds=0.0,
+                    stdout=cr.message,
+                    stderr=(cr.patch or "")[:1500],
+                )
+            )
+        else:
+            # Extract generated code from markers
+            content, errors = extract_rewrite_file(cr.patch, entry_rel)
+
+            if content is None:
+                tool_events.append(
+                    ToolEvent(
+                        name="code_agent_parse_error",
+                        cmd=["parse_generated_code"],
+                        returncode=1,
+                        seconds=0.0,
+                        stdout="; ".join(errors),
+                        stderr=cr.patch[:1500],
+                    )
+                )
+            else:
+                # Write generated code to file
+                target_path = REPO_DIR / entry_rel
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.write_text(content, encoding="utf-8")
+
+                tool_events.append(
+                    ToolEvent(
+                        name="code_agent_generate_success",
+                        cmd=["code_agent", "generate", entry_rel],
+                        returncode=0,
+                        seconds=0.0,
+                        stdout=f"Generated {len(content)} bytes to {entry_rel}",
+                        stderr="",
+                    )
+                )
+
+                # Autoformat generated code
+                tool_events.extend(autoformat(REPO_DIR))
 
     # -----------------------------
     # Phase 1: pytest loop (TestAgent)

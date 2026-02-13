@@ -10,5 +10,13 @@
     "entrypoints": [
       "src/example_pkg/math_utils.py"
     ]
+  },
+  "generate_email_validator": {
+    "description": "CodeAgent GENERATE mode: Create an email validation function",
+    "entrypoints": [
+      "src/example_pkg/validators.py"
+    ],
+    "mode": "generate",
+    "feature_description": "Create a function validate_email(email: str) -> bool that validates email addresses"
   }
 }

@@ -1,0 +1,38 @@
+{
+  "demo_add": {
+    "description": "Demo task for Week-1: ensure add(a,b) works and gates pass.",
+    "entrypoints": [
+      "src/example_pkg/math_utils.py"
+    ]
+  },
+  "demo_add_weak_tests": {
+    "description": "Demo task with intentionally weak tests to trigger mutation-strengthen loop",
+    "entrypoints": [
+      "src/example_pkg/math_utils.py"
+    ]
+  },
+  "generate_email_validator": {
+    "description": "CodeAgent GENERATE mode: Create an email validation function from description",
+    "entrypoints": [
+      "src/example_pkg/validators.py"
+    ],
+    "mode": "generate",
+    "feature_description": "Create a function validate_email(email: str) -> bool that validates email addresses. It should check for: 1) Contains exactly one @ symbol, 2) Has valid local part (before @) with alphanumeric and dots, 3) Has valid domain with at least one dot, 4) Returns True if valid, False otherwise."
+  },
+  "fix_buggy_divide": {
+    "description": "CodeAgent FIX mode: Fix a buggy division function that doesn't handle edge cases",
+    "entrypoints": [
+      "src/example_pkg/math_utils.py"
+    ],
+    "mode": "fix",
+    "setup_note": "First manually add a buggy divide() function to math_utils.py, then run this task"
+  },
+  "generate_json_parser": {
+    "description": "CodeAgent GENERATE mode: Create a safe JSON parser with error handling",
+    "entrypoints": [
+      "src/example_pkg/parsers.py"
+    ],
+    "mode": "generate",
+    "feature_description": "Create a function parse_json_safe(json_string: str) -> dict | None that safely parses JSON strings. It should: 1) Try to parse the JSON string, 2) Return the parsed dict if successful, 3) Return None if parsing fails (catch exceptions), 4) Include proper type hints and docstring."
+  }
+}
